@@ -1,0 +1,258 @@
+---
+- name: Configure Minecraft server on EC2
+  hosts: minecraft
+  become: true
+
+  vars:
+    aws_region: "us-east-1"
+
+    ecr_repository_name: "ops3-minecraft-lab"
+
+    ecr_image_tag: "mc-java21-v1"
+
+    backup_bucket_name: "ops3-nechypak-minecraft-backups"
+    minecraft_backup_prefix: "world-backups"
+
+    minecraft_dir: "/opt/minecraft"
+    minecraft_data_dir: "/opt/minecraft/data"
+    minecraft_container_name: "minecraft"
+
+    minecraft_version: "1.21.1"
+    minecraft_memory: "1G"
+
+    minecraft_motd: "Kanstantsin Nechyparenka nechypak - Ops3"
+
+  tasks:
+    - name: Install base packages required for Docker, AWS CLI, and backups
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - unzip
+          - tar
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create Docker apt keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Add Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Add Docker apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable
+
+    - name: Install Docker Engine and Docker Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker is running and enabled
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Install AWS CLI v2 when missing
+      ansible.builtin.shell: |
+        set -e
+        cd /tmp
+        curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+        rm -rf /tmp/aws
+        unzip -q -o awscliv2.zip
+        /tmp/aws/install
+      args:
+        creates: /usr/local/bin/aws
+
+    - name: Verify AWS identity from EC2 instance profile
+      ansible.builtin.command: /usr/local/bin/aws sts get-caller-identity
+      register: aws_identity
+      changed_when: false
+
+    - name: Show AWS identity used by LabInstanceProfile
+      ansible.builtin.debug:
+        var: aws_identity.stdout
+
+    - name: Get AWS account ID
+      ansible.builtin.command: /usr/local/bin/aws sts get-caller-identity --query Account --output text
+      register: aws_account_id
+      changed_when: false
+
+    - name: Set ECR registry and image URI facts
+      ansible.builtin.set_fact:
+        ecr_registry: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
+        minecraft_image_uri: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com/{{ ecr_repository_name }}:{{ ecr_image_tag }}"
+
+    - name: Authenticate Docker to ECR using instance profile credentials
+      ansible.builtin.shell: |
+        /usr/local/bin/aws ecr get-login-password --region {{ aws_region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
+      changed_when: false
+
+    - name: Create Minecraft application directory
+      ansible.builtin.file:
+        path: "{{ minecraft_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create Minecraft persistent data directory
+      ansible.builtin.file:
+        path: "{{ minecraft_data_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check if Minecraft world already exists
+      ansible.builtin.stat:
+        path: "{{ minecraft_data_dir }}/world"
+      register: minecraft_world
+
+    - name: Check if latest S3 world backup exists
+      ansible.builtin.command: >
+        /usr/local/bin/aws s3 ls
+        s3://{{ backup_bucket_name }}/{{ minecraft_backup_prefix }}/latest.tar.gz
+        --region {{ aws_region }}
+      register: s3_latest_backup
+      changed_when: false
+      failed_when: false
+
+    - name: Download latest world backup from S3 when rebuilding
+      ansible.builtin.command: >
+        /usr/local/bin/aws s3 cp
+        s3://{{ backup_bucket_name }}/{{ minecraft_backup_prefix }}/latest.tar.gz
+        /tmp/minecraft-restore.tar.gz
+        --region {{ aws_region }}
+      when:
+        - not minecraft_world.stat.exists
+        - s3_latest_backup.rc == 0
+
+    - name: Restore world data before starting Minecraft container
+      ansible.builtin.command: tar -xzf /tmp/minecraft-restore.tar.gz -C "{{ minecraft_dir }}"
+      when:
+        - not minecraft_world.stat.exists
+        - s3_latest_backup.rc == 0
+
+    - name: Explain when no previous world backup was restored
+      ansible.builtin.debug:
+        msg: "No existing world and no latest S3 backup found. Minecraft will create a fresh world on first start."
+      when:
+        - not minecraft_world.stat.exists
+        - s3_latest_backup.rc != 0
+
+    - name: Write Docker Compose file for Minecraft
+      ansible.builtin.copy:
+        dest: "{{ minecraft_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          services:
+            minecraft:
+              image: {{ minecraft_image_uri }}
+              container_name: {{ minecraft_container_name }}
+              ports:
+                - "25565:25565"
+              environment:
+                EULA: "TRUE"
+                TYPE: "PAPER"
+                VERSION: "{{ minecraft_version }}"
+                MEMORY: "{{ minecraft_memory }}"
+                MOTD: "{{ minecraft_motd }}"
+              volumes:
+                - {{ minecraft_data_dir }}:/data
+              restart: unless-stopped
+
+    - name: Pull pinned Minecraft image from ECR
+      ansible.builtin.command: docker compose pull
+      args:
+        chdir: "{{ minecraft_dir }}"
+      register: compose_pull
+      changed_when: "'Downloaded newer image' in compose_pull.stdout or 'Pull complete' in compose_pull.stdout"
+
+    - name: Start Minecraft server container
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ minecraft_dir }}"
+      register: compose_up
+      changed_when: >
+        'Started' in compose_up.stdout
+        or 'Created' in compose_up.stdout
+        or 'Recreated' in compose_up.stdout
+
+    - name: Wait for Minecraft server to finish starting
+      ansible.builtin.shell: |
+        for i in $(seq 1 18); do
+          if docker logs {{ minecraft_container_name }} 2>&1 | grep -q "Done"; then
+            exit 0
+          fi
+          sleep 10
+        done
+        docker logs {{ minecraft_container_name }} 2>&1
+        exit 1
+      changed_when: false
+
+    - name: Show running Minecraft container
+      ansible.builtin.command: docker ps --filter name={{ minecraft_container_name }}
+      register: docker_ps
+      changed_when: false
+
+    - name: Print running container result
+      ansible.builtin.debug:
+        var: docker_ps.stdout_lines
+
+    - name: Install Minecraft world backup script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/minecraft-backup.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          AWS_REGION="{{ aws_region }}"
+          BUCKET="{{ backup_bucket_name }}"
+          PREFIX="{{ minecraft_backup_prefix }}"
+          MINECRAFT_DIR="{{ minecraft_dir }}"
+          BACKUP_FILE="/tmp/minecraft-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+          cd "$MINECRAFT_DIR"
+          tar -czf "$BACKUP_FILE" data
+
+          /usr/local/bin/aws s3 cp "$BACKUP_FILE" "s3://$BUCKET/$PREFIX/$(basename "$BACKUP_FILE")" --region "$AWS_REGION"
+          /usr/local/bin/aws s3 cp "$BACKUP_FILE" "s3://$BUCKET/$PREFIX/latest.tar.gz" --region "$AWS_REGION"
+
+          rm -f "$BACKUP_FILE"
+
+    - name: Schedule Minecraft world backup every 15 minutes
+      ansible.builtin.cron:
+        name: minecraft world backup
+        minute: "*/15"
+        user: root
+        job: /usr/local/bin/minecraft-backup.sh
+        cron_file: minecraft-backup

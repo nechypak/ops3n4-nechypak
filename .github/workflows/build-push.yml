@@ -1,0 +1,99 @@
+name: Build and Push Minecraft Image to ECR
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ops3-minecraft-lab
+  DEPLOY_TAG: mc-java21-v1
+  UPSTREAM_IMAGE: itzg/minecraft-server:java21
+  MINECRAFT_VERSION: "1.21.1"
+
+jobs:
+  smoke-test-and-publish:
+    name: Smoke test and publish Minecraft image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull upstream Minecraft image for amd64
+        run: |
+          docker pull --platform linux/amd64 "${{ env.UPSTREAM_IMAGE }}"
+
+      - name: Smoke test Minecraft startup
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --platform linux/amd64 \
+            --name minecraft-smoke \
+            -e EULA=TRUE \
+            -e TYPE=PAPER \
+            -e VERSION="${{ env.MINECRAFT_VERSION }}" \
+            -e MEMORY=1G \
+            "${{ env.UPSTREAM_IMAGE }}"
+
+          for i in $(seq 1 18); do
+            echo "Smoke test attempt $i..."
+            if docker logs minecraft-smoke 2>&1 | grep -q "Done"; then
+              echo "Minecraft initialized successfully."
+              docker logs minecraft-smoke 2>&1 | tail -60
+              docker stop minecraft-smoke
+              docker rm minecraft-smoke
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Minecraft did not finish startup in time. Last logs:"
+          docker logs minecraft-smoke 2>&1 | tail -160
+          docker stop minecraft-smoke || true
+          docker rm minecraft-smoke || true
+          exit 1
+
+      - name: Tag and push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          GIT_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          docker tag "${{ env.UPSTREAM_IMAGE }}" "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.DEPLOY_TAG }}"
+          docker tag "${{ env.UPSTREAM_IMAGE }}" "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$GIT_TAG"
+
+          docker push "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.DEPLOY_TAG }}"
+          docker push "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$GIT_TAG"
+
+      - name: Verify pushed deploy image exists
+        run: |
+          aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPOSITORY }}" \
+            --image-ids imageTag="${{ env.DEPLOY_TAG }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Verify pushed git tag image exists
+        run: |
+          aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPOSITORY }}" \
+            --image-ids imageTag="${{ github.ref_name }}" \
+            --region "${{ env.AWS_REGION }}"
