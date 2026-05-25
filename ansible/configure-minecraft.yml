@@ -1,5 +1,5 @@
 ---
-- name: Configure Minecraft server on EC2
+- name: Configure Minecraft k3s server on EC2
   hosts: minecraft
   become: true
 
@@ -7,74 +7,33 @@
     aws_region: "us-east-1"
 
     ecr_repository_name: "ops3-minecraft-lab"
-
     ecr_image_tag: "mc-java21-v1"
 
     backup_bucket_name: "ops3-nechypak-minecraft-backups"
     minecraft_backup_prefix: "world-backups"
 
-    minecraft_dir: "/opt/minecraft"
-    minecraft_data_dir: "/opt/minecraft/data"
-    minecraft_container_name: "minecraft"
+    minecraft_namespace: "minecraft"
+    minecraft_deployment: "minecraft"
 
     minecraft_version: "1.21.1"
     minecraft_memory: "1G"
+    minecraft_motd: "Kanstantsin Nechyparenka nechypak - Ops4"
 
-    minecraft_motd: "Kanstantsin Nechyparenka nechypak - Ops3"
+    kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
+    rendered_manifest_path: "/opt/minecraft/minecraft.yml"
 
   tasks:
-    - name: Install base packages required for Docker, AWS CLI, and backups
+    - name: Install base packages required for k3s, AWS CLI, and backups
       ansible.builtin.apt:
         name:
           - ca-certificates
           - curl
-          - gnupg
           - unzip
           - tar
         state: present
         update_cache: true
         cache_valid_time: 3600
-
-    - name: Create Docker apt keyring directory
-      ansible.builtin.file:
-        path: /etc/apt/keyrings
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Add Docker GPG key
-      ansible.builtin.get_url:
-        url: https://download.docker.com/linux/ubuntu/gpg
-        dest: /etc/apt/keyrings/docker.asc
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Add Docker apt repository
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/docker.list
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable
-
-    - name: Install Docker Engine and Docker Compose plugin
-      ansible.builtin.apt:
-        name:
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-          - docker-compose-plugin
-        state: present
-        update_cache: true
-
-    - name: Ensure Docker is running and enabled
-      ansible.builtin.service:
-        name: docker
-        state: started
-        enabled: true
+        lock_timeout: 300
 
     - name: Install AWS CLI v2 when missing
       ansible.builtin.shell: |
@@ -86,6 +45,7 @@
         /tmp/aws/install
       args:
         creates: /usr/local/bin/aws
+        executable: /bin/bash
 
     - name: Verify AWS identity from EC2 instance profile
       ansible.builtin.command: /usr/local/bin/aws sts get-caller-identity
@@ -106,126 +66,182 @@
         ecr_registry: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
         minecraft_image_uri: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com/{{ ecr_repository_name }}:{{ ecr_image_tag }}"
 
-    - name: Authenticate Docker to ECR using instance profile credentials
+    - name: Stop old Docker Compose Minecraft container if it exists
       ansible.builtin.shell: |
-        /usr/local/bin/aws ecr get-login-password --region {{ aws_region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
-      changed_when: false
-
-    - name: Create Minecraft application directory
-      ansible.builtin.file:
-        path: "{{ minecraft_dir }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Create Minecraft persistent data directory
-      ansible.builtin.file:
-        path: "{{ minecraft_data_dir }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Check if Minecraft world already exists
-      ansible.builtin.stat:
-        path: "{{ minecraft_data_dir }}/world"
-      register: minecraft_world
-
-    - name: Check if latest S3 world backup exists
-      ansible.builtin.command: >
-        /usr/local/bin/aws s3 ls
-        s3://{{ backup_bucket_name }}/{{ minecraft_backup_prefix }}/latest.tar.gz
-        --region {{ aws_region }}
-      register: s3_latest_backup
-      changed_when: false
+        docker ps -aq --filter name=minecraft | xargs -r docker rm -f
+      args:
+        executable: /bin/bash
       failed_when: false
+      changed_when: false
 
-    - name: Download latest world backup from S3 when rebuilding
-      ansible.builtin.command: >
-        /usr/local/bin/aws s3 cp
-        s3://{{ backup_bucket_name }}/{{ minecraft_backup_prefix }}/latest.tar.gz
-        /tmp/minecraft-restore.tar.gz
-        --region {{ aws_region }}
-      when:
-        - not minecraft_world.stat.exists
-        - s3_latest_backup.rc == 0
+    - name: Install k3s if missing
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | sh -
+      args:
+        creates: /usr/local/bin/k3s
+        executable: /bin/bash
 
-    - name: Restore world data before starting Minecraft container
-      ansible.builtin.command: tar -xzf /tmp/minecraft-restore.tar.gz -C "{{ minecraft_dir }}"
-      when:
-        - not minecraft_world.stat.exists
-        - s3_latest_backup.rc == 0
+    - name: Ensure k3s service is running and enabled
+      ansible.builtin.service:
+        name: k3s
+        state: started
+        enabled: true
 
-    - name: Explain when no previous world backup was restored
-      ansible.builtin.debug:
-        msg: "No existing world and no latest S3 backup found. Minecraft will create a fresh world on first start."
-      when:
-        - not minecraft_world.stat.exists
-        - s3_latest_backup.rc != 0
+    - name: Wait for Kubernetes node to become Ready
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          if KUBECONFIG={{ kubeconfig_path }} kubectl get nodes | grep -q " Ready "; then
+            exit 0
+          fi
+          sleep 5
+        done
+        KUBECONFIG={{ kubeconfig_path }} kubectl get nodes
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
 
-    - name: Write Docker Compose file for Minecraft
+    - name: Create Minecraft working directory
+      ansible.builtin.file:
+        path: /opt/minecraft
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create Minecraft namespace first
+      ansible.builtin.shell: |
+        KUBECONFIG={{ kubeconfig_path }} kubectl create namespace {{ minecraft_namespace }} --dry-run=client -o yaml | \
+        KUBECONFIG={{ kubeconfig_path }} kubectl apply -f -
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Create or refresh ECR imagePullSecret from instance profile credentials
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        ECR_PASSWORD="$(/usr/local/bin/aws ecr get-login-password --region {{ aws_region }})"
+
+        KUBECONFIG={{ kubeconfig_path }} kubectl -n {{ minecraft_namespace }} create secret docker-registry ecr-creds \
+          --docker-server={{ ecr_registry }} \
+          --docker-username=AWS \
+          --docker-password="$ECR_PASSWORD" \
+          --dry-run=client -o yaml | \
+        KUBECONFIG={{ kubeconfig_path }} kubectl apply -f -
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Install ECR secret refresh script
       ansible.builtin.copy:
-        dest: "{{ minecraft_dir }}/docker-compose.yml"
+        dest: /usr/local/bin/refresh-ecr-secret.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          AWS_REGION="{{ aws_region }}"
+          ECR_REGISTRY="{{ ecr_registry }}"
+          KUBECONFIG="{{ kubeconfig_path }}"
+          NAMESPACE="{{ minecraft_namespace }}"
+
+          ECR_PASSWORD="$(/usr/local/bin/aws ecr get-login-password --region "$AWS_REGION")"
+
+          kubectl -n "$NAMESPACE" create secret docker-registry ecr-creds \
+            --docker-server="$ECR_REGISTRY" \
+            --docker-username=AWS \
+            --docker-password="$ECR_PASSWORD" \
+            --dry-run=client -o yaml | \
+          kubectl apply -f -
+
+    - name: Install systemd service for refreshing ECR pull secret
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/refresh-ecr-secret.service
         owner: root
         group: root
         mode: "0644"
         content: |
-          services:
-            minecraft:
-              image: {{ minecraft_image_uri }}
-              container_name: {{ minecraft_container_name }}
-              ports:
-                - "25565:25565"
-              environment:
-                EULA: "TRUE"
-                TYPE: "PAPER"
-                VERSION: "{{ minecraft_version }}"
-                MEMORY: "{{ minecraft_memory }}"
-                MOTD: "{{ minecraft_motd }}"
-              volumes:
-                - {{ minecraft_data_dir }}:/data
-              restart: unless-stopped
+          [Unit]
+          Description=Refresh Kubernetes ECR imagePullSecret for Minecraft
 
-    - name: Pull pinned Minecraft image from ECR
-      ansible.builtin.command: docker compose pull
-      args:
-        chdir: "{{ minecraft_dir }}"
-      register: compose_pull
-      changed_when: "'Downloaded newer image' in compose_pull.stdout or 'Pull complete' in compose_pull.stdout"
+          [Service]
+          Type=oneshot
+          Environment=KUBECONFIG={{ kubeconfig_path }}
+          ExecStart=/usr/local/bin/refresh-ecr-secret.sh
 
-    - name: Start Minecraft server container
-      ansible.builtin.command: docker compose up -d
-      args:
-        chdir: "{{ minecraft_dir }}"
-      register: compose_up
-      changed_when: >
-        'Started' in compose_up.stdout
-        or 'Created' in compose_up.stdout
-        or 'Recreated' in compose_up.stdout
+    - name: Install systemd timer for refreshing ECR pull secret
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/refresh-ecr-secret.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Refresh Kubernetes ECR imagePullSecret every 6 hours
 
-    - name: Wait for Minecraft server to finish starting
-      ansible.builtin.shell: |
-        for i in $(seq 1 18); do
-          if docker logs {{ minecraft_container_name }} 2>&1 | grep -q "Done"; then
-            exit 0
-          fi
-          sleep 10
-        done
-        docker logs {{ minecraft_container_name }} 2>&1
-        exit 1
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=6h
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable ECR secret refresh timer
+      ansible.builtin.systemd:
+        name: refresh-ecr-secret.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Copy Kubernetes Minecraft manifest
+      ansible.builtin.copy:
+        src: ../kubernetes/minecraft.yml
+        dest: "{{ rendered_manifest_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Apply Kubernetes Minecraft manifest
+      ansible.builtin.command: kubectl apply -f {{ rendered_manifest_path }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: kubectl_apply
+      changed_when: "'configured' in kubectl_apply.stdout or 'created' in kubectl_apply.stdout"
+
+    - name: Wait for Minecraft deployment rollout
+      ansible.builtin.command: >
+        kubectl -n {{ minecraft_namespace }} rollout status deployment/{{ minecraft_deployment }} --timeout=10m
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
       changed_when: false
 
-    - name: Show running Minecraft container
-      ansible.builtin.command: docker ps --filter name={{ minecraft_container_name }}
-      register: docker_ps
+    - name: Show Kubernetes nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: kubectl_nodes
       changed_when: false
 
-    - name: Print running container result
+    - name: Print Kubernetes nodes
       ansible.builtin.debug:
-        var: docker_ps.stdout_lines
+        var: kubectl_nodes.stdout_lines
 
-    - name: Install Minecraft world backup script
+    - name: Show Minecraft pods
+      ansible.builtin.command: kubectl -n {{ minecraft_namespace }} get pods -o wide
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: kubectl_pods
+      changed_when: false
+
+    - name: Print Minecraft pods
+      ansible.builtin.debug:
+        var: kubectl_pods.stdout_lines
+
+    - name: Install Minecraft Kubernetes backup script
       ansible.builtin.copy:
         dest: /usr/local/bin/minecraft-backup.sh
         owner: root
@@ -238,21 +254,56 @@
           AWS_REGION="{{ aws_region }}"
           BUCKET="{{ backup_bucket_name }}"
           PREFIX="{{ minecraft_backup_prefix }}"
-          MINECRAFT_DIR="{{ minecraft_dir }}"
+          NAMESPACE="{{ minecraft_namespace }}"
+          KUBECONFIG="{{ kubeconfig_path }}"
           BACKUP_FILE="/tmp/minecraft-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
 
-          cd "$MINECRAFT_DIR"
-          tar -czf "$BACKUP_FILE" data
+          POD="$(kubectl -n "$NAMESPACE" get pod -l app=minecraft -o jsonpath='{.items[0].metadata.name}')"
+
+          kubectl -n "$NAMESPACE" exec "$POD" -- tar -czf - -C /data . > "$BACKUP_FILE"
 
           /usr/local/bin/aws s3 cp "$BACKUP_FILE" "s3://$BUCKET/$PREFIX/$(basename "$BACKUP_FILE")" --region "$AWS_REGION"
           /usr/local/bin/aws s3 cp "$BACKUP_FILE" "s3://$BUCKET/$PREFIX/latest.tar.gz" --region "$AWS_REGION"
 
           rm -f "$BACKUP_FILE"
 
-    - name: Schedule Minecraft world backup every 15 minutes
-      ansible.builtin.cron:
-        name: minecraft world backup
-        minute: "*/15"
-        user: root
-        job: /usr/local/bin/minecraft-backup.sh
-        cron_file: minecraft-backup
+    - name: Install Minecraft backup systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/minecraft-backup.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Back up Minecraft Kubernetes world data to S3
+          After=k3s.service
+
+          [Service]
+          Type=oneshot
+          Environment=KUBECONFIG={{ kubeconfig_path }}
+          ExecStart=/usr/local/bin/minecraft-backup.sh
+
+    - name: Install Minecraft backup systemd timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/minecraft-backup.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Run Minecraft world backup every 15 minutes
+
+          [Timer]
+          OnBootSec=5min
+          OnUnitActiveSec=15min
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable Minecraft backup timer
+      ansible.builtin.systemd:
+        name: minecraft-backup.timer
+        enabled: true
+        state: started
+        daemon_reload: true

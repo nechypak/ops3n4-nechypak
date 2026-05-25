@@ -1,2 +1,2 @@
 [minecraft]
-minecraft-server ansible_host=44.212.1.121 ansible_user=ubuntu ansible_ssh_private_key_file=~/Downloads/cs312-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
+minecraft-server ansible_host=107.21.33.105 ansible_user=ubuntu ansible_ssh_private_key_file=~/Downloads/cs312-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'

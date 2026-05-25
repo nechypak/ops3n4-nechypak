@@ -36,7 +36,7 @@ variable "minecraft_client_cidr" {
 variable "minecraft_instance_type" {
   description = "EC2 instance type for the Minecraft managed node."
   type        = string
-  default     = "t3.small"
+  default     = "t3.medium"
 }
 
 variable "minecraft_root_volume_gib" {
