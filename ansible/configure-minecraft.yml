@@ -1,309 +1,271 @@
 ---
-- name: Configure Minecraft k3s server on EC2
+- name: Configure Minecraft server on EC2 with k3s
   hosts: minecraft
   become: true
 
   vars:
-    aws_region: "us-east-1"
-
-    ecr_repository_name: "ops3-minecraft-lab"
-    ecr_image_tag: "mc-java21-v1"
-
-    backup_bucket_name: "ops3-nechypak-minecraft-backups"
-    minecraft_backup_prefix: "world-backups"
-
-    minecraft_namespace: "minecraft"
-    minecraft_deployment: "minecraft"
-
+    ecr_repo_url: "339712937184.dkr.ecr.us-east-1.amazonaws.com/ops4-ecr-nechypak"
+    minecraft_image: "v1.0.0"
+    bucket_name: "ops4-s3-nechypak"
+    world_backup_key: "backup.tar.gz"
+    data_dir: "/opt/minecraft-kubernetes"
     minecraft_version: "1.21.1"
-    minecraft_memory: "1G"
-    minecraft_motd: "Kanstantsin Nechyparenka nechypak - Ops4"
-
-    kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
-    rendered_manifest_path: "/opt/minecraft/minecraft.yml"
+    motd: "Kanstantsin Nechyparenka nechypak 934561768"
 
   tasks:
-    - name: Install base packages required for k3s, AWS CLI, and backups
-      ansible.builtin.apt:
+    - name: Install packages needed for k3s, AWS, and downloads
+      apt:
         name:
-          - ca-certificates
           - curl
-          - unzip
-          - tar
+          - ca-certificates
+          - gnupg
+          - awscli
         state: present
         update_cache: true
-        cache_valid_time: 3600
-        lock_timeout: 300
 
-    - name: Install AWS CLI v2 when missing
-      ansible.builtin.shell: |
-        set -e
-        cd /tmp
-        curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-        rm -rf /tmp/aws
-        unzip -q -o awscliv2.zip
-        /tmp/aws/install
-      args:
-        creates: /usr/local/bin/aws
-        executable: /bin/bash
-
-    - name: Verify AWS identity from EC2 instance profile
-      ansible.builtin.command: /usr/local/bin/aws sts get-caller-identity
-      register: aws_identity
-      changed_when: false
-
-    - name: Show AWS identity used by LabInstanceProfile
-      ansible.builtin.debug:
-        var: aws_identity.stdout
-
-    - name: Get AWS account ID
-      ansible.builtin.command: /usr/local/bin/aws sts get-caller-identity --query Account --output text
-      register: aws_account_id
-      changed_when: false
-
-    - name: Set ECR registry and image URI facts
-      ansible.builtin.set_fact:
-        ecr_registry: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
-        minecraft_image_uri: "{{ aws_account_id.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com/{{ ecr_repository_name }}:{{ ecr_image_tag }}"
-
-    - name: Stop old Docker Compose Minecraft container if it exists
-      ansible.builtin.shell: |
-        docker ps -aq --filter name=minecraft | xargs -r docker rm -f
-      args:
-        executable: /bin/bash
-      failed_when: false
-      changed_when: false
-
-    - name: Install k3s if missing
-      ansible.builtin.shell: |
+    - name: Install k3s lightweight Kubernetes
+      shell: |
         curl -sfL https://get.k3s.io | sh -
       args:
         creates: /usr/local/bin/k3s
-        executable: /bin/bash
 
-    - name: Ensure k3s service is running and enabled
-      ansible.builtin.service:
-        name: k3s
-        state: started
-        enabled: true
+    - name: Prepare kubeconfig for root user
+      shell: |
+        mkdir -p /root/.kube
+        cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+        chown root:root /root/.kube/config
+        chmod 600 /root/.kube/config
 
-    - name: Wait for Kubernetes node to become Ready
-      ansible.builtin.shell: |
-        for i in $(seq 1 30); do
-          if KUBECONFIG={{ kubeconfig_path }} kubectl get nodes | grep -q " Ready "; then
-            exit 0
-          fi
-          sleep 5
-        done
-        KUBECONFIG={{ kubeconfig_path }} kubectl get nodes
-        exit 1
-      args:
-        executable: /bin/bash
-      changed_when: false
-
-    - name: Create Minecraft working directory
-      ansible.builtin.file:
-        path: /opt/minecraft
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Create Minecraft namespace first
-      ansible.builtin.shell: |
-        KUBECONFIG={{ kubeconfig_path }} kubectl create namespace {{ minecraft_namespace }} --dry-run=client -o yaml | \
-        KUBECONFIG={{ kubeconfig_path }} kubectl apply -f -
-      args:
-        executable: /bin/bash
-      changed_when: false
-
-    - name: Create or refresh ECR imagePullSecret from instance profile credentials
-      ansible.builtin.shell: |
-        set -euo pipefail
-
-        ECR_PASSWORD="$(/usr/local/bin/aws ecr get-login-password --region {{ aws_region }})"
-
-        KUBECONFIG={{ kubeconfig_path }} kubectl -n {{ minecraft_namespace }} create secret docker-registry ecr-creds \
-          --docker-server={{ ecr_registry }} \
+    - name: Create or update image pull secret for private ECR image
+      shell: |
+        kubectl create secret docker-registry ecr-secret \
+          --docker-server=339712937184.dkr.ecr.us-east-1.amazonaws.com \
           --docker-username=AWS \
-          --docker-password="$ECR_PASSWORD" \
-          --dry-run=client -o yaml | \
-        KUBECONFIG={{ kubeconfig_path }} kubectl apply -f -
-      args:
-        executable: /bin/bash
-      changed_when: false
+          --docker-password=$(aws ecr get-login-password --region us-east-1) \
+          --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
 
-    - name: Install ECR secret refresh script
-      ansible.builtin.copy:
-        dest: /usr/local/bin/refresh-ecr-secret.sh
-        owner: root
-        group: root
+    - name: Create directory for Kubernetes YAML files
+      file:
+        path: "{{ data_dir }}"
+        state: directory
         mode: "0755"
+
+    - name: Create persistent storage manifest
+      copy:
+        dest: "{{ data_dir }}/01-minecraft-pvc.yaml"
         content: |
-          #!/usr/bin/env bash
-          set -euo pipefail
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: minecraft-pvc
+            labels:
+              app: minecraft
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: local-path
+            resources:
+              requests:
+                storage: 10Gi
 
-          AWS_REGION="{{ aws_region }}"
-          ECR_REGISTRY="{{ ecr_registry }}"
-          KUBECONFIG="{{ kubeconfig_path }}"
-          NAMESPACE="{{ minecraft_namespace }}"
-
-          ECR_PASSWORD="$(/usr/local/bin/aws ecr get-login-password --region "$AWS_REGION")"
-
-          kubectl -n "$NAMESPACE" create secret docker-registry ecr-creds \
-            --docker-server="$ECR_REGISTRY" \
-            --docker-username=AWS \
-            --docker-password="$ECR_PASSWORD" \
-            --dry-run=client -o yaml | \
-          kubectl apply -f -
-
-    - name: Install systemd service for refreshing ECR pull secret
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/refresh-ecr-secret.service
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          [Unit]
-          Description=Refresh Kubernetes ECR imagePullSecret for Minecraft
-
-          [Service]
-          Type=oneshot
-          Environment=KUBECONFIG={{ kubeconfig_path }}
-          ExecStart=/usr/local/bin/refresh-ecr-secret.sh
-
-    - name: Install systemd timer for refreshing ECR pull secret
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/refresh-ecr-secret.timer
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          [Unit]
-          Description=Refresh Kubernetes ECR imagePullSecret every 6 hours
-
-          [Timer]
-          OnBootSec=2min
-          OnUnitActiveSec=6h
-          Persistent=true
-
-          [Install]
-          WantedBy=timers.target
-
-    - name: Enable ECR secret refresh timer
-      ansible.builtin.systemd:
-        name: refresh-ecr-secret.timer
-        enabled: true
-        state: started
-        daemon_reload: true
-
-    - name: Copy Kubernetes Minecraft manifest
-      ansible.builtin.copy:
-        src: ../kubernetes/minecraft.yml
-        dest: "{{ rendered_manifest_path }}"
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Apply Kubernetes Minecraft manifest
-      ansible.builtin.command: kubectl apply -f {{ rendered_manifest_path }}
+    - name: Apply persistent storage manifest
+      shell: |
+        kubectl apply -f {{ data_dir }}/01-minecraft-pvc.yaml
       environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubectl_apply
-      changed_when: "'configured' in kubectl_apply.stdout or 'created' in kubectl_apply.stdout"
+        KUBECONFIG: /root/.kube/config
 
-    - name: Wait for Minecraft deployment rollout
-      ansible.builtin.command: >
-        kubectl -n {{ minecraft_namespace }} rollout status deployment/{{ minecraft_deployment }} --timeout=10m
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      changed_when: false
-
-    - name: Show Kubernetes nodes
-      ansible.builtin.command: kubectl get nodes -o wide
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubectl_nodes
-      changed_when: false
-
-    - name: Print Kubernetes nodes
-      ansible.builtin.debug:
-        var: kubectl_nodes.stdout_lines
-
-    - name: Show Minecraft pods
-      ansible.builtin.command: kubectl -n {{ minecraft_namespace }} get pods -o wide
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubectl_pods
-      changed_when: false
-
-    - name: Print Minecraft pods
-      ansible.builtin.debug:
-        var: kubectl_pods.stdout_lines
-
-    - name: Install Minecraft Kubernetes backup script
-      ansible.builtin.copy:
-        dest: /usr/local/bin/minecraft-backup.sh
-        owner: root
-        group: root
-        mode: "0755"
+    - name: Create Minecraft configuration manifest
+      copy:
+        dest: "{{ data_dir }}/02-minecraft-configmap.yaml"
         content: |
-          #!/usr/bin/env bash
-          set -euo pipefail
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: minecraft-config
+            labels:
+              app: minecraft
+          data:
+            EULA: "TRUE"
+            VERSION: "{{ minecraft_version }}"
+            MOTD: "{{ motd }}"
 
-          AWS_REGION="{{ aws_region }}"
-          BUCKET="{{ backup_bucket_name }}"
-          PREFIX="{{ minecraft_backup_prefix }}"
-          NAMESPACE="{{ minecraft_namespace }}"
-          KUBECONFIG="{{ kubeconfig_path }}"
-          BACKUP_FILE="/tmp/minecraft-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    - name: Apply Minecraft configuration manifest
+      shell: |
+        kubectl apply -f {{ data_dir }}/02-minecraft-configmap.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
 
-          POD="$(kubectl -n "$NAMESPACE" get pod -l app=minecraft -o jsonpath='{.items[0].metadata.name}')"
-
-          kubectl -n "$NAMESPACE" exec "$POD" -- tar -czf - -C /data . > "$BACKUP_FILE"
-
-          /usr/local/bin/aws s3 cp "$BACKUP_FILE" "s3://$BUCKET/$PREFIX/$(basename "$BACKUP_FILE")" --region "$AWS_REGION"
-          /usr/local/bin/aws s3 cp "$BACKUP_FILE" "s3://$BUCKET/$PREFIX/latest.tar.gz" --region "$AWS_REGION"
-
-          rm -f "$BACKUP_FILE"
-
-    - name: Install Minecraft backup systemd service
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/minecraft-backup.service
-        owner: root
-        group: root
-        mode: "0644"
+    - name: Create Minecraft network service manifest
+      copy:
+        dest: "{{ data_dir }}/03-minecraft-service.yaml"
         content: |
-          [Unit]
-          Description=Back up Minecraft Kubernetes world data to S3
-          After=k3s.service
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: minecraft-service
+            labels:
+              app: minecraft
+          spec:
+            type: LoadBalancer
+            selector:
+              app: minecraft
+            ports:
+              - name: minecraft
+                port: 25565
+                targetPort: 25565
+                protocol: TCP
 
-          [Service]
-          Type=oneshot
-          Environment=KUBECONFIG={{ kubeconfig_path }}
-          ExecStart=/usr/local/bin/minecraft-backup.sh
+    - name: Apply Minecraft network service manifest
+      shell: |
+        kubectl apply -f {{ data_dir }}/03-minecraft-service.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
 
-    - name: Install Minecraft backup systemd timer
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/minecraft-backup.timer
-        owner: root
-        group: root
-        mode: "0644"
+    - name: Create Minecraft deployment manifest
+      copy:
+        dest: "{{ data_dir }}/04-minecraft-deployment.yaml"
         content: |
-          [Unit]
-          Description=Run Minecraft world backup every 15 minutes
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: minecraft
+            labels:
+              app: minecraft
+          spec:
+            replicas: 1
+            strategy:
+              type: Recreate
+            selector:
+              matchLabels:
+                app: minecraft
+            template:
+              metadata:
+                labels:
+                  app: minecraft
+              spec:
+                imagePullSecrets:
+                  - name: ecr-secret
+                containers:
+                  - name: minecraft
+                    image: {{ ecr_repo_url }}:{{ minecraft_image }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 25565
+                    envFrom:
+                      - configMapRef:
+                          name: minecraft-config
+                    volumeMounts:
+                      - name: minecraft-storage
+                        mountPath: /data
+                    resources:
+                      requests:
+                        cpu: "250m"
+                        memory: "1Gi"
+                      limits:
+                        cpu: "1000m"
+                        memory: "1Gi"
+                    startupProbe:
+                      tcpSocket:
+                        port: 25565
+                      failureThreshold: 60
+                      periodSeconds: 10
+                    readinessProbe:
+                      tcpSocket:
+                        port: 25565
+                      initialDelaySeconds: 60
+                      periodSeconds: 10
+                    livenessProbe:
+                      tcpSocket:
+                        port: 25565
+                      initialDelaySeconds: 90
+                      periodSeconds: 10
+                volumes:
+                  - name: minecraft-storage
+                    persistentVolumeClaim:
+                      claimName: minecraft-pvc
 
-          [Timer]
-          OnBootSec=5min
-          OnUnitActiveSec=15min
-          Persistent=true
+    - name: Apply Minecraft deployment manifest
+      shell: |
+        kubectl apply -f {{ data_dir }}/04-minecraft-deployment.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
 
-          [Install]
-          WantedBy=timers.target
+    - name: Create S3 backup job manifest
+      copy:
+        dest: "{{ data_dir }}/05-minecraft-backup.yaml"
+        content: |
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: minecraft-backup
+            labels:
+              app: minecraft
+              purpose: backup
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: minecraft-backup
+                    image: alpine:3.19
+                    command:
+                      - /bin/sh
+                      - -c
+                    args:
+                      - |
+                        set -e
+                        echo "Installing tools for backup"
+                        apk add --no-cache aws-cli tar gzip
+                        echo "Creating compressed world archive"
+                        tar -czf /tmp/{{ world_backup_key }} -C /data .
+                        echo "Uploading backup archive to S3"
+                        aws s3 cp /tmp/{{ world_backup_key }} s3://{{ bucket_name }}/{{ world_backup_key }}
+                        echo "Backup completed"
+                    volumeMounts:
+                      - name: minecraft-storage
+                        mountPath: /data
+                volumes:
+                  - name: minecraft-storage
+                    persistentVolumeClaim:
+                      claimName: minecraft-pvc
 
-    - name: Enable Minecraft backup timer
-      ansible.builtin.systemd:
-        name: minecraft-backup.timer
-        enabled: true
-        state: started
-        daemon_reload: true
+    - name: Create S3 restore job manifest
+      copy:
+        dest: "{{ data_dir }}/06-minecraft-restore.yaml"
+        content: |
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: minecraft-restore
+            labels:
+              app: minecraft
+              purpose: restore
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: minecraft-restore
+                    image: alpine:3.19
+                    command:
+                      - /bin/sh
+                      - -c
+                    args:
+                      - |
+                        set -e
+                        echo "Installing tools for restore"
+                        apk add --no-cache aws-cli tar gzip
+                        echo "Downloading backup archive from S3"
+                        aws s3 cp s3://{{ bucket_name }}/{{ world_backup_key }} /tmp/{{ world_backup_key }}
+                        echo "Restoring archive into Minecraft data directory"
+                        tar -xzf /tmp/{{ world_backup_key }} -C /data
+                        echo "Restore completed"
+                    volumeMounts:
+                      - name: minecraft-storage
+                        mountPath: /data
+                volumes:
+                  - name: minecraft-storage
+                    persistentVolumeClaim:
+                      claimName: minecraft-pvc

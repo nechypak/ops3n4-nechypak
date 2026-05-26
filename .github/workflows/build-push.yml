@@ -5,26 +5,22 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: read
-
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: ops3-minecraft-lab
-  DEPLOY_TAG: mc-java21-v1
-  UPSTREAM_IMAGE: itzg/minecraft-server:java21
+  ECR_REPOSITORY: ops4-ecr-nechypak
+  UPSTREAM_IMAGE: itzg/minecraft-server:2026.3.2-java21
   MINECRAFT_VERSION: "1.21.1"
 
 jobs:
-  smoke-test-and-publish:
-    name: Smoke test and publish Minecraft image
+  build-test-push:
+    name: Build, test, and push Minecraft image
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Check out repository files
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Academy credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -32,68 +28,60 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
+      - name: Log in to Amazon ECR
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Pull upstream Minecraft image for amd64
+      - name: Pull pinned upstream Minecraft server image
         run: |
-          docker pull --platform linux/amd64 "${{ env.UPSTREAM_IMAGE }}"
+          docker pull ${{ env.UPSTREAM_IMAGE }}
 
-      - name: Smoke test Minecraft startup
+      - name: Retag upstream image for local test
         run: |
-          set -euo pipefail
+          docker tag ${{ env.UPSTREAM_IMAGE }} \
+            ${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}
+
+      - name: Run Minecraft smoke test
+        run: |
+          echo "Starting Minecraft smoke test..."
 
           docker run -d \
-            --platform linux/amd64 \
-            --name minecraft-smoke \
+            --name minecraft-smoke-test \
             -e EULA=TRUE \
-            -e TYPE=PAPER \
-            -e VERSION="${{ env.MINECRAFT_VERSION }}" \
+            -e VERSION=${{ env.MINECRAFT_VERSION }} \
             -e MEMORY=1G \
-            "${{ env.UPSTREAM_IMAGE }}"
+            ${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}
 
-          for i in $(seq 1 18); do
-            echo "Smoke test attempt $i..."
-            if docker logs minecraft-smoke 2>&1 | grep -q "Done"; then
-              echo "Minecraft initialized successfully."
-              docker logs minecraft-smoke 2>&1 | tail -60
-              docker stop minecraft-smoke
-              docker rm minecraft-smoke
+          echo "Waiting for Minecraft server initialization..."
+
+          for i in $(seq 1 12); do
+            echo "Smoke test attempt $i of 12"
+
+            if docker logs minecraft-smoke-test 2>&1 | grep -q "Done"; then
+              echo "Minecraft server started successfully."
+              docker stop minecraft-smoke-test
+              docker rm minecraft-smoke-test
               exit 0
             fi
+
             sleep 10
           done
 
-          echo "Minecraft did not finish startup in time. Last logs:"
-          docker logs minecraft-smoke 2>&1 | tail -160
-          docker stop minecraft-smoke || true
-          docker rm minecraft-smoke || true
+          echo "Minecraft server failed to start during smoke test."
+          docker logs minecraft-smoke-test || true
+          docker stop minecraft-smoke-test || true
+          docker rm minecraft-smoke-test || true
           exit 1
 
-      - name: Tag and push image to ECR
+      - name: Tag image with ECR registry path
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          GIT_TAG: ${{ github.ref_name }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
-          set -euo pipefail
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ github.ref_name }} \
+            $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}
 
-          docker tag "${{ env.UPSTREAM_IMAGE }}" "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.DEPLOY_TAG }}"
-          docker tag "${{ env.UPSTREAM_IMAGE }}" "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$GIT_TAG"
-
-          docker push "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.DEPLOY_TAG }}"
-          docker push "$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$GIT_TAG"
-
-      - name: Verify pushed deploy image exists
+      - name: Push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
-          aws ecr describe-images \
-            --repository-name "${{ env.ECR_REPOSITORY }}" \
-            --image-ids imageTag="${{ env.DEPLOY_TAG }}" \
-            --region "${{ env.AWS_REGION }}"
-
-      - name: Verify pushed git tag image exists
-        run: |
-          aws ecr describe-images \
-            --repository-name "${{ env.ECR_REPOSITORY }}" \
-            --image-ids imageTag="${{ github.ref_name }}" \
-            --region "${{ env.AWS_REGION }}"
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}
